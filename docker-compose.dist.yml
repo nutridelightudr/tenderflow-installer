@@ -1,0 +1,162 @@
+# Customer-facing distribution compose stack.
+#
+# Same topology as docker-compose.prod.yml but uses pre-built images from
+# the registry — no source checkout needed. End customers download THIS
+# file (not the repo), set a few env vars, and run `docker compose up -d`.
+#
+# Quick start:
+#   curl -O https://raw.githubusercontent.com/nutridelightudr/tenderflow-installer/main/docker-compose.dist.yml
+#   curl -O https://raw.githubusercontent.com/nutridelightudr/tenderflow-installer/main/.env.dist.example
+#   cp .env.dist.example .env
+#   # edit .env: set DOMAIN, POSTGRES_PASSWORD, JWT_SECRET, ACME_EMAIL
+#   docker compose -f docker-compose.dist.yml up -d
+#   # browser: https://your-domain.example.com/setup
+#
+# Update path:
+#   docker compose -f docker-compose.dist.yml pull
+#   docker compose -f docker-compose.dist.yml up -d
+#   # data preserved in volumes; migrations auto-run on backend boot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tenderflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tenderflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-tenderflow}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tenderflow_user} -d ${POSTGRES_DB:-tenderflow}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  backend:
+    image: ghcr.io/${IMAGE_OWNER:-nutridelightudr}/tenderflow-backend:${APP_VERSION:-latest}
+    container_name: tenderflow-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      APP_VERSION: ${APP_VERSION:-latest}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-tenderflow_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tenderflow}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env (32+ random chars)}
+      # Match whatever URL customers actually browse to. Default mirrors
+      # the default HTTP_PORT (8080); production overrides DOMAIN_URL with
+      # the real https origin.
+      CORS_ORIGIN: ${DOMAIN_URL:-http://localhost:8080}
+      USE_HTTPS: "false"
+      AUTO_MIGRATE: "true"
+      MIGRATE_BACKUP: ${MIGRATE_BACKUP:-false}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+    volumes:
+      - tenderflow_data:/data
+    expose:
+      - "4000"
+
+  frontend:
+    image: ghcr.io/${IMAGE_OWNER:-nutridelightudr}/tenderflow-frontend:${APP_VERSION:-latest}
+    container_name: tenderflow-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    expose:
+      - "80"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: tenderflow-mailpit
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    expose:
+      - "1025"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: tenderflow-caddy
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
+    # Default to high ports so the stack starts cleanly on any host without
+    # conflicting with an existing web server. For a production domain with
+    # automatic Let's Encrypt, set HTTP_PORT=80 and HTTPS_PORT=443 in .env
+    # (port 80 is required for the ACME HTTP-01 challenge).
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+      DOMAIN_HTTP_FALLBACK: ${DOMAIN_HTTP_FALLBACK:-:9090}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+
+configs:
+  # Inline Caddyfile — customers don't need a second file.
+  # DOMAIN: real hostname (HTTPS + Let's Encrypt) or :80 (HTTP-only local)
+  # DOMAIN_HTTP_FALLBACK: :80 in domain mode so IP access always works;
+  #   defaults to :9090 (unmapped, harmless) in local mode.
+  caddyfile:
+    content: |
+      {
+          email {$$ACME_EMAIL}
+      }
+      (app) {
+          encode gzip zstd
+          handle /api/* {
+              reverse_proxy backend:4000 {
+                  header_up X-Real-IP {remote_host}
+                  header_up X-Forwarded-For {remote_host}
+                  header_up X-Forwarded-Proto {scheme}
+                  transport http {
+                      read_timeout 1h
+                      write_timeout 1h
+                  }
+              }
+          }
+          handle /api-docs {
+              reverse_proxy backend:4000
+          }
+          handle /api-spec.json {
+              reverse_proxy backend:4000
+          }
+          handle {
+              reverse_proxy frontend:80
+          }
+          header {
+              -Server
+              X-Content-Type-Options "nosniff"
+              Referrer-Policy "strict-origin-when-cross-origin"
+              Permissions-Policy "geolocation=(), microphone=(), camera=()"
+          }
+      }
+      {$$DOMAIN} {
+          import app
+      }
+      {$$DOMAIN_HTTP_FALLBACK::9090} {
+          import app
+      }
+
+volumes:
+  pgdata:
+    name: tenderflow_pgdata
+  tenderflow_data:
+    name: tenderflow_data
+  caddy_data:
+    name: tenderflow_caddy_data
+  caddy_config:
+    name: tenderflow_caddy_config
